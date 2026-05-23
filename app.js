@@ -147,6 +147,9 @@ async function generateSpeech() {
   hideError();
   hidePlayer();
 
+  const loadingTextElement = btnLoading.querySelector('span');
+  const originalLoadingText = loadingTextElement ? loadingTextElement.textContent : 'Generating...';
+
   try {
     const model = modelSelect.value;
     const voiceName = voiceSelect.value;
@@ -193,79 +196,129 @@ async function generateSpeech() {
       systemParts.push('Use audio tags for granular control of tone, pacing, and expression as appropriate for the content.');
     }
 
-    const contents = [];
-
-    // TTS models don't support system_instruction.
-    // Prepend style directions into the text prompt instead.
-    let finalText = text;
-    if (systemParts.length > 0) {
-      const directions = systemParts.join('. ');
-      finalText = `[${directions}]\n\n${text}`;
+    // Split text into chunks (increased to ~1000 characters to reduce API requests and avoid rate limits)
+    let chunks = splitTextIntoChunks(text, 1000);
+    if (chunks.length === 0) {
+      chunks = [text];
     }
-
-    // User content
-    contents.push({
-      role: 'user',
-      parts: [{ text: finalText }]
-    });
-
-    const requestBody = {
-      contents: contents,
-      generationConfig: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: voiceName
-            }
-          }
-        }
-      }
-    };
+    
+    const chunkBuffers = [];
+    let sampleRate = 24000;
+    let mimeType = 'audio/L16;rate=24000';
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${state.apiKey}`;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody),
-    });
+    // Loop through chunks sequentially
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkText = chunks[i];
+      
+      // Update dynamic loading text
+      if (loadingTextElement) {
+        loadingTextElement.textContent = `Generating chunk ${i + 1} of ${chunks.length}...`;
+      }
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => null);
-      const errMsg = errorData?.error?.message || `API Error: ${response.status} ${response.statusText}`;
-      throw new Error(errMsg);
+      // Prepend style directions into the text prompt for each chunk
+      let finalText = chunkText;
+      if (systemParts.length > 0) {
+        const directions = systemParts.join('. ');
+        finalText = `[${directions}]\n\n${chunkText}`;
+      }
+
+      const contents = [{
+        role: 'user',
+        parts: [{ text: finalText }]
+      }];
+
+      const requestBody = {
+        contents: contents,
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: voiceName
+              }
+            }
+          }
+        }
+      };
+
+      let response;
+      const retries = 3;
+      let delay = 4000; // 4 seconds initial delay for rate limits
+
+      for (let attempt = 0; attempt < retries; attempt++) {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+        });
+
+        if (response.ok) {
+          break;
+        }
+
+        const errorData = await response.json().catch(() => null);
+        const errMsg = errorData?.error?.message || `API Error: ${response.status} ${response.statusText}`;
+
+        // If it's a rate limit or quota error, wait and retry
+        if (response.status === 429 || errMsg.toLowerCase().includes('quota') || errMsg.toLowerCase().includes('rate limit')) {
+          if (attempt < retries - 1) {
+            console.warn(`Rate limit / Quota exceeded. Retrying chunk ${i + 1} (Attempt ${attempt + 1}/${retries}) in ${delay/1000}s...`);
+            if (loadingTextElement) {
+              loadingTextElement.textContent = `Rate limit hit. Retrying in ${delay/1000}s...`;
+            }
+            await new Promise(resolve => setTimeout(resolve, delay));
+            delay += 4000; // Linear backoff (4s, then 8s)
+            continue;
+          }
+        }
+
+        throw new Error(`Chunk ${i + 1} failed: ${errMsg}`);
+      }
+
+      const data = await response.json();
+
+      // Extract audio data
+      const candidate = data.candidates?.[0];
+      if (!candidate) {
+        throw new Error(`No response candidate returned from the API for chunk ${i + 1}`);
+      }
+
+      const audioPart = candidate.content?.parts?.find(p => p.inlineData);
+      if (!audioPart) {
+        throw new Error(`No audio data in the response for chunk ${i + 1}. The model may not support audio output.`);
+      }
+
+      const audioBase64 = audioPart.inlineData.data;
+      const currentMimeType = audioPart.inlineData.mimeType || 'audio/L16;rate=24000';
+      if (i === 0) {
+        mimeType = currentMimeType;
+        sampleRate = extractSampleRate(mimeType);
+      }
+
+      // Decode audio chunk
+      const rawBytes = base64ToArrayBuffer(audioBase64);
+
+      // Strip WAV header (44 bytes) if it exists, otherwise keep whole raw PCM bytes
+      if (currentMimeType.includes('wav')) {
+        chunkBuffers.push(rawBytes.slice(44));
+      } else {
+        chunkBuffers.push(rawBytes);
+      }
     }
 
-    const data = await response.json();
-
-    // Extract audio data
-    const candidate = data.candidates?.[0];
-    if (!candidate) {
-      throw new Error('No response candidate returned from the API');
+    // Dynamic loading text final status
+    if (loadingTextElement) {
+      loadingTextElement.textContent = 'Assembling final audio...';
     }
 
-    const audioPart = candidate.content?.parts?.find(p => p.inlineData);
-    if (!audioPart) {
-      throw new Error('No audio data in the response. The model may not support audio output with the current configuration.');
-    }
+    // Concatenate all PCM chunks
+    const concatenatedPCM = concatenateBuffers(chunkBuffers);
 
-    const audioBase64 = audioPart.inlineData.data;
-    const mimeType = audioPart.inlineData.mimeType || 'audio/L16;rate=24000';
-
-    // Decode audio
-    const rawBytes = base64ToArrayBuffer(audioBase64);
-
-    // Determine if we need to add WAV headers
-    let audioBlob;
-    if (mimeType.includes('wav')) {
-      audioBlob = new Blob([rawBytes], { type: 'audio/wav' });
-    } else {
-      // Raw PCM — add WAV header
-      const sampleRate = extractSampleRate(mimeType);
-      const wavBuffer = pcmToWav(rawBytes, sampleRate, 1, 16);
-      audioBlob = new Blob([wavBuffer], { type: 'audio/wav' });
-    }
+    // Rebuild WAV header from raw PCM
+    const wavBuffer = pcmToWav(concatenatedPCM, sampleRate, 1, 16);
+    const audioBlob = new Blob([wavBuffer], { type: 'audio/wav' });
 
     state.currentAudioBlob = audioBlob;
 
@@ -292,7 +345,92 @@ async function generateSpeech() {
     showToast('Generation failed', 'error');
   } finally {
     setGenerating(false);
+    // Restore original loading text
+    if (loadingTextElement) {
+      loadingTextElement.textContent = originalLoadingText;
+    }
   }
+}
+
+// ── TTS Chunking & Concatenation Helpers ────────────────
+function splitTextIntoChunks(text, maxChars = 400) {
+  if (text.length <= maxChars) {
+    return [text];
+  }
+  
+  // Split using sentence-ending punctuation (including newlines) as delimiters, keeping the delimiters
+  const parts = text.split(/([။\.\?\!\n]+)/);
+  const sentences = [];
+  
+  for (let i = 0; i < parts.length; i += 2) {
+    const textPart = parts[i] || "";
+    const delim = parts[i + 1] || "";
+    const sentence = textPart + delim;
+    if (sentence.trim().length > 0) {
+      sentences.push(sentence);
+    }
+  }
+
+  const chunks = [];
+  let currentChunk = "";
+
+  for (const sentence of sentences) {
+    if ((currentChunk + sentence).length > maxChars) {
+      if (currentChunk.trim().length > 0) {
+        chunks.push(currentChunk);
+      }
+      currentChunk = sentence;
+    } else {
+      currentChunk += sentence;
+    }
+  }
+
+  if (currentChunk.trim().length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  // Fallback: If any chunk is still larger than maxChars * 1.5 (e.g. no punctuation),
+  // split it by spaces or word boundaries to stay safe.
+  const finalChunks = [];
+  for (const chunk of chunks) {
+    if (chunk.length > maxChars * 1.5) {
+      const words = chunk.split(/(\s+)/);
+      let subChunk = "";
+      for (const word of words) {
+        if ((subChunk + word).length > maxChars) {
+          if (subChunk.trim().length > 0) {
+            finalChunks.push(subChunk);
+          }
+          subChunk = word;
+        } else {
+          subChunk += word;
+        }
+      }
+      if (subChunk.trim().length > 0) {
+        finalChunks.push(subChunk);
+      }
+    } else {
+      finalChunks.push(chunk);
+    }
+  }
+
+  return finalChunks.filter(c => c.trim().length > 0);
+}
+
+function concatenateBuffers(buffers) {
+  let totalLength = 0;
+  for (const buf of buffers) {
+    totalLength += buf.byteLength;
+  }
+  
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const buf of buffers) {
+    result.set(new Uint8Array(buf), offset);
+    offset += buf.byteLength;
+  }
+  
+  return result.buffer;
 }
 
 // ── Audio Utilities ────────────────────────────────────
@@ -493,3 +631,222 @@ function showToast(message, type = 'info') {
     setTimeout(() => toast.remove(), 200);
   }, 3000);
 }
+
+// ══════════════════════════════════════════════════════
+// VO TRANSLATE TAB
+// ══════════════════════════════════════════════════════
+
+// ── Tab Switching ──────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    const tabId = 'tab-' + btn.dataset.tab;
+    document.getElementById(tabId).classList.add('active');
+  });
+});
+
+// ── Translate DOM Elements ─────────────────────────────
+const translateInput = $('#translate-input');
+const translateFileInput = $('#translate-file-input');
+const translateUploadZone = $('#translate-upload-zone');
+const translateFileInfo = $('#translate-file-info');
+const translateFileName = $('#translate-file-name');
+const translateFileRemove = $('#translate-file-remove');
+const translateCharCount = $('#translate-char-count');
+const translateClear = $('#translate-clear');
+const translateModelSelect = $('#translate-model-select');
+const translateBtn = $('#translate-btn');
+const translateBtnContent = $('#translate-btn-content');
+const translateBtnLoading = $('#translate-btn-loading');
+const translateOutputEmpty = $('#translate-output-empty');
+const translateOutput = $('#translate-output');
+const translateResultWrapper = $('#translate-result-wrapper');
+const translateCopyBtn = $('#translate-copy-btn');
+const translateDownloadBtn = $('#translate-download-btn');
+const translateError = $('#translate-error');
+const translateErrorMessage = $('#translate-error-message');
+
+let translateResultText = '';
+
+// ── File Upload ────────────────────────────────────────
+translateUploadZone.addEventListener('click', () => translateFileInput.click());
+
+translateUploadZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  translateUploadZone.classList.add('drag-over');
+});
+
+translateUploadZone.addEventListener('dragleave', () => {
+  translateUploadZone.classList.remove('drag-over');
+});
+
+translateUploadZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  translateUploadZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) handleTranslateFile(file);
+});
+
+translateFileInput.addEventListener('change', () => {
+  const file = translateFileInput.files[0];
+  if (file) handleTranslateFile(file);
+});
+
+function handleTranslateFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    translateInput.value = e.target.result;
+    updateTranslateCharCount();
+    translateFileName.textContent = file.name;
+    translateFileInfo.style.display = 'flex';
+    translateUploadZone.style.display = 'none';
+    showToast(`Loaded: ${file.name}`, 'success');
+  };
+  reader.readAsText(file);
+}
+
+translateFileRemove.addEventListener('click', () => {
+  translateFileInput.value = '';
+  translateFileInfo.style.display = 'none';
+  translateUploadZone.style.display = 'block';
+  translateInput.value = '';
+  updateTranslateCharCount();
+});
+
+translateInput.addEventListener('input', updateTranslateCharCount);
+translateClear.addEventListener('click', () => {
+  translateInput.value = '';
+  updateTranslateCharCount();
+  translateInput.focus();
+});
+
+function updateTranslateCharCount() {
+  const len = translateInput.value.length;
+  translateCharCount.textContent = `${len.toLocaleString()} character${len !== 1 ? 's' : ''}`;
+}
+
+// ── VO Translation Prompt ──────────────────────────────
+const VO_TRANSLATE_PROMPT = `သင်သည် ကျွမ်းကျင်သော Voice-over Script ဘာသာပြန်ဆရာ တစ်ဦးဖြစ်သည်။ ပေးထားသော စာသားကို မြန်မာဘာသာ Voice-over Script အဖြစ် ပြောင်းလဲပေးပါ။
+
+အရေးကြီးသော စည်းမျဉ်းများ -
+- မူရင်းစာသားကို တိုက်ရိုက်ဘာသာပြန်ခြင်းမျိုး လုံးဝမလုပ်ပါနှင့်။ မြန်မာလူမျိုးတစ်ယောက် သူ့ဘာသာစကားနဲ့ သဘာဝကျကျ ပြောပြသလိုမျိုး ပြန်ရေးပေးပါ။
+- VO Script စာသားကို စာကြောင်းမခြားဘဲ တဆက်တည်း စီးဆင်းစွာ ရေးပေးပါ။ စာပိုဒ်ခွဲခြင်း၊ နံပါတ်တပ်ခြင်း၊ ခေါင်းစဉ်ထည့်ခြင်း မလုပ်ပါနှင့်။
+- အသံသွင်းမည့်သူ လိုက်ဆိုရလွယ်ကူစေရန် သင့်တော်သောနေရာများတွင် [slowly], [seriously], [warmly], [sadly], [excitedly], [laughs], [music], [pause], [whisper], [loud] စသည့် Audio Tags များကို ထည့်သွင်းပေးရန်။
+- "ခွေး" ဟူသော စကားလုံးကို "ဝုလေး" ဟု အစားထိုးသုံးစွဲရန်။
+- VO script အဆုံးတွင် စာကြောင်းတစ်ကြောင်းခြားပြီး VO အကြောင်းအရာ၏ အဓိပ္ပါယ်နှင့် သက်ဆိုင်သော English Disclaimer တစ်ခု ထည့်ပေးပါ။
+- Output format: VO script စာသား + audio tags (တဆက်တည်း) ပြီးမှ English Disclaimer။ အခြားအပိုစာသား မပါစေရ။`;
+
+
+// ── Translate Function ─────────────────────────────────
+translateBtn.addEventListener('click', translateVO);
+
+async function translateVO() {
+  if (!state.apiKey) {
+    showToast('Please enter your API key first', 'error');
+    apiKeyInput.focus();
+    document.getElementById('tab-btn-tts').click(); // switch to see API field
+    return;
+  }
+
+  const sourceText = translateInput.value.trim();
+  if (!sourceText) {
+    showToast('Please enter or upload source text', 'error');
+    translateInput.focus();
+    return;
+  }
+
+  // UI: loading state
+  translateBtn.disabled = true;
+  translateBtnContent.style.display = 'none';
+  translateBtnLoading.style.display = 'flex';
+  translateError.style.display = 'none';
+  translateOutputEmpty.style.display = 'none';
+  translateResultWrapper.style.display = 'none';
+
+  try {
+    const model = translateModelSelect.value;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${state.apiKey}`;
+
+    const requestBody = {
+      system_instruction: {
+        parts: [{ text: VO_TRANSLATE_PROMPT }]
+      },
+      contents: [{
+        role: 'user',
+        parts: [{ text: sourceText }]
+      }],
+      generationConfig: {
+        temperature: 0.8,
+        maxOutputTokens: 8192
+      }
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => null);
+      const errMsg = errorData?.error?.message || `API Error: ${response.status} ${response.statusText}`;
+      throw new Error(errMsg);
+    }
+
+    const data = await response.json();
+    const candidate = data.candidates?.[0];
+    if (!candidate) throw new Error('No response candidate returned');
+
+    const textPart = candidate.content?.parts?.find(p => p.text);
+    if (!textPart) throw new Error('No text in response');
+
+    translateResultText = textPart.text;
+    translateOutput.textContent = translateResultText;
+    translateResultWrapper.style.display = 'block';
+
+    showToast('Translation completed!', 'success');
+
+  } catch (err) {
+    console.error('Translate Error:', err);
+    translateError.style.display = 'flex';
+    translateErrorMessage.textContent = err.message;
+    showToast('Translation failed', 'error');
+  } finally {
+    translateBtn.disabled = false;
+    translateBtnContent.style.display = 'flex';
+    translateBtnLoading.style.display = 'none';
+  }
+}
+
+// ── Copy & Download ────────────────────────────────────
+translateCopyBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(translateResultText).then(() => {
+    showToast('Copied to clipboard!', 'success');
+  }).catch(() => {
+    // Fallback
+    const ta = document.createElement('textarea');
+    ta.value = translateResultText;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast('Copied to clipboard!', 'success');
+  });
+});
+
+translateDownloadBtn.addEventListener('click', () => {
+  if (!translateResultText) return;
+  const blob = new Blob([translateResultText], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  a.download = `vo-script-${ts}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  showToast('Script downloaded!', 'success');
+});
